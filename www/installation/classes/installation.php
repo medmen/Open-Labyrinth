@@ -97,7 +97,7 @@ class Installation {
                         $host = $olab['db_host'];
                     }
 
-                    $link = @mysql_connect($host, $olab['db_user'], $olab['db_pass']);
+                    $link = @mysqli_connect($host, $olab['db_user'], $olab['db_pass']);
 
                     if($link == false){
                         Notice::add('An error occurred while trying connect to the database.');
@@ -544,7 +544,7 @@ class Installation {
         $temp['item'] = 'MySQL';
         $temp['label'] = 'success';
         $temp['status'] = 'On';
-        if (function_exists('mysql_connect')){
+        if (function_exists('mysqli_connect')){
             $temp['ac-label'] = 'success';
             $temp['ac-status'] = 'On';
         } else {
@@ -620,27 +620,38 @@ class Installation {
         } else {
             $host = $olab['db_host'];
         }
-        //TODO: The mysql extension is deprecated and will be removed in the future: use mysqli or PDO instead
-        $link = @mysql_connect($host, $olab['db_user'], $olab['db_pass']);
+        $link = @mysqli_connect($host, $olab['db_user'], $olab['db_pass']);
+        /* check connection */
+        if (mysqli_connect_errno()) {
+            throw new ErrorException("Connect failed in ".__FILE__." : ".__LINE__.": %s\n". mysqli_connect_error());
+        }
 
-        $db_selected = mysql_select_db($olab['db_name']);
+        $db_selected = mysqli_select_db($link, $olab['db_name']);
         if ($db_selected) {
             if ($olab['db_old'] == 'backup'){
                 $rand = rand();
                 $query = "SELECT concat('RENAME TABLE ".$olab['db_name'].".',table_name, ' TO " . $olab['db_name'] . "_" . $rand . ".',table_name, ';') as string_query FROM information_schema.TABLES WHERE table_schema='".$olab['db_name']."';";
-                mysql_query('CREATE DATABASE ' . $olab['db_name'] . "_" . $rand);
-                $responce = mysql_query($query) or die(mysql_error());
-                while($result = mysql_fetch_array($responce)){
-                    mysql_query($result['string_query']);
+                if (false == mysqli_query($link, 'CREATE DATABASE ' . $olab['db_name'] . "_" . $rand)) {
+                    throw new ErrorException(__FILE__." : ".__LINE__.":".mysqli_error($link));
+                }
+
+                $responce = mysqli_query($link, $query) or throw new ErrorException(mysqli_error($link));
+                while($result = mysqli_fetch_array($responce)){
+                    if (false == mysqli_query($link, $result['string_query'])) {
+                        throw new ErrorException(__FILE__." : ".__LINE__.":".mysqli_error($link));
+                    }
+                    mysqli_free_result($result);
                 }
             }
         }
-        mysql_query('DROP DATABASE IF EXISTS '.$olab['db_name']);
-        mysql_query('CREATE DATABASE '.$olab['db_name']);
-        mysql_select_db($olab['db_name']);
 
-        Installation::populateDatabase(INST_DOCROOT.'sql/CreateDB.sql');
-        Installation::runUpdates();
+
+        mysqli_query($link,'DROP DATABASE IF EXISTS '.$olab['db_name']) or throw new ErrorException(__FILE__." : ".__LINE__.":".mysqli_error($link));
+        mysqli_query($link,'CREATE DATABASE '.$olab['db_name']) or throw new ErrorException(__FILE__." : ".__LINE__.":".mysqli_error($link));
+        mysqli_select_db($link, $olab['db_name']) or throw new ErrorException(__FILE__." : ".__LINE__.":".mysqli_error($link));
+
+        Installation::populateDatabase($link, INST_DOCROOT.'sql/CreateDB.sql');
+        Installation::runUpdates($link);
 
         $olabUser = json_decode(Session::get('installationConfiguration'), true);
 
@@ -648,7 +659,7 @@ class Installation {
 
         $query = "INSERT INTO `users` (`id`, `username`, `password`, `email`, `nickname`, `language_id`, `type_id`) VALUES
 (1, '" . $olabUser['admin_user'] . "', '" . $password . "', '" . $olabUser['admin_email'] . "', 'administrator', 1, 4);";
-        mysql_query($query);
+        mysqli_query($link, $query) or die(mysqli_error($link));
 
         $databaseConfig = '$config = array();
         $config["default"] = array(
@@ -753,7 +764,13 @@ class Installation {
         rmdir($dirPath);
     }
 
-    public static function runUpdates(){
+    /**
+     * run sql updates sorted by version, track success in json file
+     *
+     * @param $link
+     * @return int
+     */
+    public static function runUpdates($link){
         $result = 0;
         $dir = DOCROOT.'updates/';
         if(is_dir($dir)){
@@ -764,6 +781,7 @@ class Installation {
                 $infoFile = $dir.'history.json';
                 if (!file_exists($infoFile)){
                     if (!is_writable($dir)){
+                        throw new ErrorException(__FILE__.":".__LINE__.": $infoFile is not writeable");
                         return 3;
                     }
                     $infoFileHandler = fopen($infoFile, 'w');
@@ -775,12 +793,13 @@ class Installation {
 
                 if (count($files) > 0){
                     usort($files, array('Installation', 'sortVersionInOrder'));
+
                     foreach($files as $f){
                         $ext = pathinfo($f, PATHINFO_EXTENSION);
                         if ($ext == 'sql'){
                             $pathToFile = $dir.$f;
                             if (!isset($skipFiles[$f])){
-                                Installation::populateDatabase($pathToFile);
+                                Installation::populateDatabase($link, $pathToFile);
                                 $skipFiles[$f] = 1;
                                 $result = 1;
                             }
@@ -798,7 +817,14 @@ class Installation {
         return $result;
     }
 
+    /**
+     * Sort array of version numbers
+     * @param $a
+     * @param $b
+     * @return int
+     */
     public static function sortVersionInOrder($a, $b) {
+
         $ext = pathinfo($a, PATHINFO_EXTENSION);
         if ($ext != 'sql'){
             return -1;
@@ -810,30 +836,7 @@ class Installation {
         }
 
 
-        $resultA = self::sortVersionInOrderPregReplace($a);
-        $resultB = self::sortVersionInOrderPregReplace($b);
-
-        if ($resultA == $resultB) {
-            return 0;
-        }
-
-        return ($resultA-$resultB > 0) ? 1 : -1;
-    }
-
-    public static function sortVersionInOrderPregReplace($str) {
-        $result = '';
-        $regExp = '/(?<=v)(.*?)(?=\.sql)/is';
-        $regExpDot = '/(\.)/e';
-
-        if ($c=preg_match_all ($regExp, $str, $matches)) {
-            if (isset($matches[0][0])) {
-                $found = 0;
-                //TODO: replace preg_replace by preg_replace_callback
-                $result = @self::replaceSpecialChar(preg_replace($regExpDot, '$found++ ? \'\' : \'$1\'', $matches[0][0]));
-            }
-        }
-
-        return $result;
+        return version_compare($a, $b);
     }
 
     public static function replaceSpecialChar($str) {
@@ -850,9 +853,11 @@ class Installation {
         return $resultStr;
     }
 
-    public static function populateDatabase($schema)
+    public static function populateDatabase($link, $schema)
     {
         $return = true;
+        Notice::add('Running Schema '.$schema);
+        print_r($schema."<br>\n");
 
         // Get the contents of the schema file.
         if (!($buffer = file_get_contents($schema)))
@@ -872,7 +877,7 @@ class Installation {
             if (!empty($query) && ($query{0} != '#') && ($query{0} != '-'))
             {
                 // Execute the query.
-                $result = mysql_query($query) or die(mysql_error());
+                $result = mysqli_query($link, $query) or die(__FILE__." : ".__LINE__.":".mysqli_error($link).". Schema:".$schema);
 
                 if (!$result){
                     $return = false;
